@@ -5,11 +5,28 @@ const axios =require('axios');
 
 
 const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function runWorker(){
-    console.log("worker initilized. starting core loop...")
+    console.log("worker initilized. starting core loop...");
+    try{
+        console.log("[Startup] Sweeping for stuck PROCESSING webhooks...");
+        //rescues webhook stranded in 'processing' state from past crash
+        const sweepResult = await pool.query(es
+            `UPDATE webhook_queue
+            SET status ='RETRYING,
+                retry_at=NOW(),
+                updated_at=NOW(),
+            WHERE status ='PROCESSING'
+                AND updated_at <NOW()-INTERVAL '5 minutes';`
+        );
+        console.log(`[Startup] crash recovery compelete.rescued ${sweepResult.rowCount} started webhooks.`)
+
+    }catch(startupRrr){
+        console.log(`[Startup] critical failure running crash recovery sweeep:",startupErr`);
+    }
     while(true){
-        const client =await pool.connect();
+        let client = null;
         let clientReleased=false;
         try{
+            client =await pool.connect();
             await client.query("BEGIN");
             const result = await client.query(
                 `SELECT id,url,payload,retry_count,max_retries
@@ -36,6 +53,8 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
             await client.query("COMMIT");
             client.release();
             clientReleased=true;
+            const activeWebhook = webhook;
+            client = null;
 
             //the post method
             console.log(`[worker]Delivering webhook ${webhook.id} to ${webhook.url}`);
@@ -78,16 +97,25 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
 
         }catch(err){
             //this catch block now strictly handles db/runtime transaction failures
-            if(!clientReleased){
-                try{await client.query("ROLLBACK");}catch(e){}
+            if(!clientReleased && client){
+                try{
+                    await client.query("ROLLBACK");
+                }
+                catch(e){
+
+                }
             }
             console.error(err);
-
+            await sleep(5000);
         }finally{
-            if(!clientReleased){
-                client.release();
-            }
+            if(!clientReleased && client && typeof client.release ==='function'){
+                try{
+                    client.release();
+                }catch(releaseErr){
+                    console.error("Error during emergency release:",releaseErr);
+                }
         }
+    }
 
     }
 }
