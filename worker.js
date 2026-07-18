@@ -1,4 +1,4 @@
-const pool=require('./database');
+const pool=require('./config/database');
 const axios =require('axios');
 
 
@@ -9,29 +9,29 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
     try{
         console.log("[Startup] Sweeping for stuck PROCESSING webhooks...");
         //rescues webhook stranded in 'processing' state from past crash
-        const sweepResult = await pool.query(es
+        const sweepResult = await pool.query(
             `UPDATE webhook_queue
-            SET status ='RETRYING,
+            SET status ='RETRYING',
                 retry_at=NOW(),
-                updated_at=NOW(),
+                updated_at=NOW()
             WHERE status ='PROCESSING'
                 AND updated_at <NOW()-INTERVAL '5 minutes';`
         );
         console.log(`[Startup] crash recovery compelete.rescued ${sweepResult.rowCount} started webhooks.`)
 
-    }catch(startupRrr){
-        console.log(`[Startup] critical failure running crash recovery sweeep:",startupErr`);
+    }catch(startupErr){
+        console.log(`[Startup] critical failure running crash recovery sweep:`,startupErr);
     }
     while(true){
         let client = null;
-        let clientReleased=false;
+        // let clientReleased=false;
         try{
             client =await pool.connect();
             await client.query("BEGIN");
             const result = await client.query(
                 `SELECT id,url,payload,retry_count,max_retries
                 FROM webhook_queue
-                WHERE status = 'PENDING'
+                WHERE status IN ('PENDING','RETRYING')
                     AND retry_at<=NOW()
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1`
@@ -39,7 +39,7 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
             //if no jobs available , commit,release client,sleep and try again
             if(result.rows.length === 0){
                 await client.query("COMMIT");
-                client.release();
+                // client.release();
                 await sleep(1000);
                 continue;            
             }
@@ -52,7 +52,7 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
             //commit the transaction early so we dont hold the db row lock during the network call
             await client.query("COMMIT");
             client.release();
-            clientReleased=true;
+            // clientReleased=true;
             const activeWebhook = webhook;
             client = null;
 
@@ -61,11 +61,11 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
 
             try{
                 await axios.post(webhook.url,webhook.payload,{timeout:5000});
-
+                // await Promise.resolve();
                 //if succes update process to success
                 await pool.query(
                     `UPDATE webhook_queue SET status ='SUCCESS',updated_at=NOW() WHERE id =$1;`,
-                    [webhook.id] 
+                    [activeWebhook.id] 
                 );
                 console.log(`[worker] webhook ${webhook.id} sent successfully.`);
 
@@ -73,12 +73,12 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
                 console.error(`[worker] Network request failed for webhook ${webhook.id}`)
                 //exponential backoff calculation 
                 const nextRetryCount = webhook.retry_count +1;
-                if(nextRetryCount >=webhook.max.retries){
+                if(nextRetryCount >=webhook.max_retries){
                     //if fails it will fail permanentaly
                     await pool.query(`UPDATE webhook_queue SET status = 'FAILED',updated_at=NOW() where id=$1;`,
-                    [webhook.id]
+                    [activeWebhook.id]
                     );
-                    console.error(`[worker] webhook ${webhook.id} failed permanently.`);
+                    console.error(`[worker] webhook ${activeWebhook.id} failed permanently.`);
                 }else{
                     //backoff logic :2^ retry_count sec(2,4,8,16,32......)
                     const delaySeconds=Math.pow(2,nextRetryCount);
@@ -86,10 +86,10 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
                         `UPDATE webhook_queue
                         SET status = 'RETRYING',
                             retry_count=$1,
-                            retry_at=NOw()+INTERVAL '${delaySeconds} seconds',
+                            retry_at=NOw()+($3 || 'seconds')::INTERVAL ',
                             updated_at=NOW()
                         WHERE id=$2;`,
-                        [nextRetryCount,webhook.id]
+                        [nextRetryCount,activeWebhook.id,delaySeconds]
                     );
                     console.warn(`[Worker] Retrying webhook ${webhook.id} in ${delaySeconds} seconds`);
                 }
@@ -97,7 +97,9 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
 
         }catch(err){
             //this catch block now strictly handles db/runtime transaction failures
-            if(!clientReleased && client){
+    
+            console.error(err);
+            if(client){
                 try{
                     await client.query("ROLLBACK");
                 }
@@ -105,10 +107,9 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
 
                 }
             }
-            console.error(err);
             await sleep(5000);
         }finally{
-            if(!clientReleased && client && typeof client.release ==='function'){
+            if(client && typeof client.release === 'function'){
                 try{
                     client.release();
                 }catch(releaseErr){
@@ -119,4 +120,5 @@ const sleep =(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));async function
 
     }
 }
-runWorker();
+
+module.exports={runWorker};

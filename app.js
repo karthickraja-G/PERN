@@ -1,9 +1,12 @@
 const express = require('express');
-const pool=require('./database');
+const pool=require('./config/database');
+const {runWorker}=require('./worker');
+const cors = require("cors");
 const app = express();
 
 //middleware
 app.use(express.json());
+app.use(cors());
 
 
 //get
@@ -39,5 +42,8 @@ app.post('/webhook',async (req, res) => {
 
 
 app.listen(3000,() =>{
-    console.log("Server is running on port 3000")
+    console.log("Server is running on port 3000");
+    console.log("[Worker] Starting backround engine loop...");
+
+    runWorker().catch(err=> console.error("Worker loop encountered an error:",err));
 });
